@@ -11,40 +11,17 @@
 
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-  // ── Helper: dispatcha la sequenza completa di eventi su UN elemento ──
-  function dispatchSequenzaEventi(elemento, x, y) {
-    if (!elemento || !elemento.isConnected) return;
-    const opzioni = {
-      bubbles: true,
-      cancelable: true,
-      view: window,
-      clientX: x,
-      clientY: y,
-      screenX: x,
-      screenY: y,
-      button: 0,
-      buttons: 1,
-      pointerId: 1,
-      pointerType: 'mouse',
-      isPrimary: true,
-      composed: true,
-    };
-    try { elemento.dispatchEvent(new PointerEvent('pointerdown', opzioni)); } catch { }
-    try { elemento.dispatchEvent(new MouseEvent('mousedown', { ...opzioni, buttons: 1 })); } catch { }
-    try { elemento.dispatchEvent(new PointerEvent('pointerup', { ...opzioni, buttons: 0 })); } catch { }
-    try { elemento.dispatchEvent(new MouseEvent('mouseup', { ...opzioni, buttons: 0 })); } catch { }
-  }
-
   // ── Simula un click REALE ──
   // Diagnostica ha confermato: il listener di toggle NON è sull'header
   // ".cursor-pointer.relative.align-middle" ma su un suo figlio interno.
   // L'unico modo che funziona è chiamare .click() sul VERO elemento topmost
   // alle coordinate del centro (quello che riceverebbe un click umano).
-  // Strategia minima per evitare doppio-toggle:
-  //   1. scrollIntoView se necessario
-  //   2. document.elementFromPoint(centro) → topmost
-  //   3. dispatch leggero pointer/mouse down/up sul topmost (per UI feedback)
-  //   4. topmost.click() — UNICA chiamata click, niente sull'elemento originale.
+  //
+  // IMPORTANTE: NIENTE dispatch di pointerdown/mousedown prima del click.
+  // Su questa piattaforma alcuni capitoli reagiscono al toggle SU pointerdown,
+  // poi il successivo .click() lo richiude → "doppio toggle" che lascia il
+  // capitolo nello stato originale. Il diagnostico ha mostrato che la sola
+  // cosa che apre in modo affidabile è `topmost.click()` puro.
   function clickReale(elemento) {
     if (!elemento || !elemento.isConnected) return;
 
@@ -69,12 +46,13 @@
       target = elemento;
     }
 
-    // Dispatch leggero per simulare la pressione (alcuni componenti reagiscono
-    // su pointerdown/mousedown). Niente click qui per evitare doppio-toggle.
-    dispatchSequenzaEventi(target, x, y);
-
     // Click vero sul topmost: l'unica cosa che ha funzionato nel diagnostico.
     try { target.click(); } catch { }
+  }
+
+  // ── Helper: il chevron-down è presente? (capitolo CHIUSO) ──
+  function eChiuso(elementoCapitolo) {
+    return !!elementoCapitolo.querySelector('path[id="chevron-down-Filled_1_"]');
   }
 
   // ── Legge la percentuale totale del corso ─────────────────
@@ -116,13 +94,14 @@
 
   // ── Apre un singolo capitolo con polling affidabile (NON chiude mai) ──
   // Strategia robusta contro il virtual scroll + Vue:
-  //  1) Scroll into view
-  //  2) Attesa che il header sia renderizzato (chevron presente)
-  //  3) Lettura stato (chevron-down = chiuso) e CLICK REALE se necessario
-  //  4) Polling sui figli (durate o bullseye) fino a max 5s
-  //  5) Se ancora vuoto, scrolla di nuovo e fai un secondo tentativo di click
+  //  1) Scroll into view + attesa header renderizzato
+  //  2) Loop fino a MAX_TENTATIVI: se chiuso → click reale → verifica
+  //     che il chevron sia DAVVERO cambiato. Se no, riscrolla e riprova.
+  //  3) Quando il chevron è "up" (aperto), poll sui figli per max 5s.
   // Restituisce true se al termine ci sono figli renderizzati.
   async function apriCapitolo(capitolo, prossimoHeader) {
+    const MAX_TENTATIVI = 5;
+
     // 1. Scrolla l'header nella viewport
     try {
       capitolo.elemento.scrollIntoView({ block: 'center', behavior: 'instant' });
@@ -134,28 +113,40 @@
     // 2. Attesa che il header sia renderizzato (virtual scroll)
     await attendiHeaderRenderizzato(capitolo.elemento);
 
-    // 3. Leggi stato e CLICK REALE se chiuso
-    let chevronDown = capitolo.elemento.querySelector('path[id="chevron-down-Filled_1_"]');
-    if (chevronDown) {
+    // 3. Loop di apertura con verifica del cambio di stato del chevron
+    for (let tentativo = 1; tentativo <= MAX_TENTATIVI; tentativo++) {
+      // Già aperto? Bene.
+      if (!eChiuso(capitolo.elemento)) break;
+
+      // Riassicura la posizione PRIMA di ogni click (la chiusura del precedente
+      // o il render del virtual scroll possono aver mosso l'elemento).
+      try {
+        capitolo.elemento.scrollIntoView({ block: 'center', behavior: 'instant' });
+      } catch { }
+      await sleep(250);
+      await attendiHeaderRenderizzato(capitolo.elemento, 1500);
+
       clickReale(capitolo.elemento);
-      await sleep(900);
+
+      // Aspetto che il chevron giri (max ~1.2s a tentativo)
+      let atteso = 0;
+      const passo = 150;
+      const limite = 1200;
+      while (atteso < limite && eChiuso(capitolo.elemento)) {
+        await sleep(passo);
+        atteso += passo;
+      }
+
+      if (!eChiuso(capitolo.elemento)) break; // aperto!
+
+      if (tentativo < MAX_TENTATIVI) {
+        console.log(`[Pegaso] 🔁 Capitolo non aperto, retry click ${tentativo + 1}/${MAX_TENTATIVI}...`);
+        await sleep(300 + tentativo * 200); // backoff progressivo
+      }
     }
 
-    // 4. Polling: aspetta finché i figli sono renderizzati (max 5s)
-    let figli = await attendiFigli(capitolo.elemento, prossimoHeader, 5000);
-    if (figli) return true;
-
-    // 5. Secondo tentativo con click reale
-    console.log('[Pegaso] 🔄 Nessun figlio dopo l\'apertura, riprovo con click reale + scroll...');
-    capitolo.elemento.scrollIntoView({ block: 'start' });
-    await sleep(600);
-    chevronDown = capitolo.elemento.querySelector('path[id="chevron-down-Filled_1_"]');
-    if (chevronDown) {
-      clickReale(capitolo.elemento);
-      await sleep(1000);
-    }
-    figli = await attendiFigli(capitolo.elemento, prossimoHeader, 4000);
-    return figli;
+    // 4. Polling finale: aspetta finché i figli sono renderizzati (max 5s)
+    return await attendiFigli(capitolo.elemento, prossimoHeader, 5000);
   }
 
   // ── Polling: aspetta che ci siano figli renderizzati nel container del capitolo ──
@@ -183,17 +174,27 @@
     return false;
   }
 
-  // ── Chiude un singolo capitolo (con scroll into view per affidabilità) ──
+  // ── Chiude un singolo capitolo (con verifica del cambio di stato) ──
   async function chiudiCapitolo(capitolo) {
     try { capitolo.elemento.scrollIntoView({ block: 'center' }); } catch { }
     await sleep(200);
     // Attendi che il header sia renderizzato prima di leggere lo stato
     await attendiHeaderRenderizzato(capitolo.elemento, 1500);
-    const chevronDown = capitolo.elemento.querySelector('path[id="chevron-down-Filled_1_"]');
-    const eAperto = !chevronDown;
-    if (eAperto) {
+
+    // Se è già chiuso (chevron-down presente), non fare nulla
+    if (eChiuso(capitolo.elemento)) return;
+
+    // Loop di chiusura con verifica: stesso pattern di apriCapitolo
+    for (let tentativo = 1; tentativo <= 3; tentativo++) {
+      if (eChiuso(capitolo.elemento)) return;
       clickReale(capitolo.elemento);
-      await sleep(500);
+      let atteso = 0;
+      while (atteso < 1000 && !eChiuso(capitolo.elemento)) {
+        await sleep(150);
+        atteso += 150;
+      }
+      if (eChiuso(capitolo.elemento)) return;
+      await sleep(200);
     }
   }
 
