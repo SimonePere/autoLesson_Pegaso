@@ -50,9 +50,14 @@
     try { target.click(); } catch { }
   }
 
-  // ── Helper: il chevron-down è presente? (capitolo CHIUSO) ──
-  function eChiuso(elementoCapitolo) {
-    return !!elementoCapitolo.querySelector('path[id="chevron-down-Filled_1_"]');
+  // ── Stato "aperto" basato sul CONTENUTO REALE (ground truth) ──
+  // Un capitolo è aperto se nel suo container ci sono figli renderizzati
+  // (durate mm:ss o icona bullseye-arrow). NON usiamo il chevron come
+  // sorgente di verità: i suoi <path> SVG hanno ID auto-numerati (_1_, _2_,
+  // ...) che cambiano dopo i re-render Vue → falsi negativi che fanno
+  // saltare interi capitoli.
+  function capitoloAperto(headerCapitolo, prossimoHeader) {
+    return haFigliNelRange(headerCapitolo, prossimoHeader);
   }
 
   // ── Legge la percentuale totale del corso ─────────────────
@@ -113,10 +118,23 @@
     // 2. Attesa che il header sia renderizzato (virtual scroll)
     await attendiHeaderRenderizzato(capitolo.elemento);
 
-    // 3. Loop di apertura con verifica del cambio di stato del chevron
+    // 2b. Attesa "grace period" per dare tempo ai figli di apparire se il
+    //     capitolo era GIÀ aperto (es. quelli completati prima dello script).
+    //     Senza questa attesa entriamo subito nel retry-loop e clicchiamo
+    //     inutilmente (rischiando anche di CHIUDERLO al primo click).
+    let attesaIniziale = 0;
+    while (attesaIniziale < 1200 && !capitoloAperto(capitolo.elemento, prossimoHeader)) {
+      await sleep(200);
+      attesaIniziale += 200;
+    }
+
+    // 3. Loop di apertura basato sul CONTENUTO REALE (non sul chevron).
+    //    Il chevron-down ha ID auto-numerati (_1_, _2_, ...) che cambiano
+    //    dopo i re-render Vue, quindi non è una fonte di verità affidabile.
+    //    Affidiamoci alla presenza dei figli del capitolo.
     for (let tentativo = 1; tentativo <= MAX_TENTATIVI; tentativo++) {
-      // Già aperto? Bene.
-      if (!eChiuso(capitolo.elemento)) break;
+      // Già aperto (figli presenti nel suo container)? Bene.
+      if (capitoloAperto(capitolo.elemento, prossimoHeader)) break;
 
       // Riassicura la posizione PRIMA di ogni click (la chiusura del precedente
       // o il render del virtual scroll possono aver mosso l'elemento).
@@ -128,16 +146,16 @@
 
       clickReale(capitolo.elemento);
 
-      // Aspetto che il chevron giri (max ~1.2s a tentativo)
+      // Aspetto che i figli appaiano (max ~1.5s a tentativo)
       let atteso = 0;
       const passo = 150;
-      const limite = 1200;
-      while (atteso < limite && eChiuso(capitolo.elemento)) {
+      const limite = 1500;
+      while (atteso < limite && !capitoloAperto(capitolo.elemento, prossimoHeader)) {
         await sleep(passo);
         atteso += passo;
       }
 
-      if (!eChiuso(capitolo.elemento)) break; // aperto!
+      if (capitoloAperto(capitolo.elemento, prossimoHeader)) break; // aperto!
 
       if (tentativo < MAX_TENTATIVI) {
         console.log(`[Pegaso] 🔁 Capitolo non aperto, retry click ${tentativo + 1}/${MAX_TENTATIVI}...`);
@@ -170,30 +188,32 @@
       const txt = (d.textContent || '').trim();
       if (/^\d{1,3}:\d{2}$/.test(txt)) return true;
     }
-    if (container.querySelector('svg path[id="bullseye-arrow"]')) return true;
+    // Anche l'icona bullseye-arrow può avere ID auto-numerati: usa starts-with
+    if (container.querySelector('svg path[id^="bullseye-arrow"]')) return true;
     return false;
   }
 
   // ── Chiude un singolo capitolo (con verifica del cambio di stato) ──
-  async function chiudiCapitolo(capitolo) {
+  // Usa la presenza dei figli come ground truth (non il chevron).
+  async function chiudiCapitolo(capitolo, prossimoHeader) {
     try { capitolo.elemento.scrollIntoView({ block: 'center' }); } catch { }
     await sleep(200);
     // Attendi che il header sia renderizzato prima di leggere lo stato
     await attendiHeaderRenderizzato(capitolo.elemento, 1500);
 
-    // Se è già chiuso (chevron-down presente), non fare nulla
-    if (eChiuso(capitolo.elemento)) return;
+    // Se è già chiuso (nessun figlio renderizzato), non fare nulla
+    if (!capitoloAperto(capitolo.elemento, prossimoHeader)) return;
 
-    // Loop di chiusura con verifica: stesso pattern di apriCapitolo
+    // Loop di chiusura con verifica
     for (let tentativo = 1; tentativo <= 3; tentativo++) {
-      if (eChiuso(capitolo.elemento)) return;
+      if (!capitoloAperto(capitolo.elemento, prossimoHeader)) return;
       clickReale(capitolo.elemento);
       let atteso = 0;
-      while (atteso < 1000 && !eChiuso(capitolo.elemento)) {
+      while (atteso < 1000 && capitoloAperto(capitolo.elemento, prossimoHeader)) {
         await sleep(150);
         atteso += 150;
       }
-      if (eChiuso(capitolo.elemento)) return;
+      if (!capitoloAperto(capitolo.elemento, prossimoHeader)) return;
       await sleep(200);
     }
   }
@@ -216,7 +236,7 @@
       // Il candidato è buono se contiene il header E almeno UN figlio "interessante"
       // (durata mm:ss o bullseye-arrow) oltre al solo header.
       const haContenuti =
-        candidato.querySelector('svg path[id="bullseye-arrow"]') ||
+        candidato.querySelector('svg path[id^="bullseye-arrow"]') ||
         Array.from(candidato.querySelectorAll('.text-sm.text-platform-gray'))
           .some(d => /^\d{1,3}:\d{2}$/.test((d.textContent || '').trim()));
       if (haContenuti) {
@@ -560,7 +580,9 @@
     // Chiude il capitolo PRECEDENTE per non gonfiare la sidebar
     // (con 40+ capitoli aperti il virtual scroll diventa instabile)
     if (i > 0 && capitoliCorrenti[i - 1]) {
-      await chiudiCapitolo(capitoliCorrenti[i - 1]);
+      // Per scopare correttamente il container del precedente passiamo
+      // come "prossimoHeader" l'header del capitolo corrente.
+      await chiudiCapitolo(capitoliCorrenti[i - 1], headerCorrente);
     }
 
     // Apre il capitolo corrente con scroll-into-view + apertura forzata
