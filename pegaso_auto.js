@@ -1,32 +1,26 @@
 (async function () {
 
+  // ── Configurazione ──
   const TEST_MODE = false;
   const OBIETTIVO_PERCENTUALE = 70;
   const PAUSA_TRA_LEZIONI_MS = 3000;
 
-  // ── Limita l'esecuzione a un range di capitoli (1-based, inclusivo) ──
-  // Esempio: SOLO_CAPITOLI = [37, 38] esegue solo i capitoli 37 e 38.
-  // Lascia null per processare tutti i capitoli.
+  // Selezione capitoli (tutti 1-based, inclusivi):
+  //   CAPITOLO_INIZIO  : numero del primo capitolo da processare (default 1)
+  //   SOLO_CAPITOLI    : array di numeri specifici (es. [37,38]); null = tutti
+  //   SOLO_OBIETTIVI   : se true salta i video, clicca solo l'item "Obiettivi"
+  const CAPITOLO_INIZIO = 1;
   const SOLO_CAPITOLI = null;
+  const SOLO_OBIETTIVI = false;
 
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-  // ── Simula un click REALE ──
-  // Diagnostica ha confermato: il listener di toggle NON è sull'header
-  // ".cursor-pointer.relative.align-middle" ma su un suo figlio interno.
-  // L'unico modo che funziona è chiamare .click() sul VERO elemento topmost
-  // alle coordinate del centro (quello che riceverebbe un click umano).
-  //
-  // IMPORTANTE: NIENTE dispatch di pointerdown/mousedown prima del click.
-  // Su questa piattaforma alcuni capitoli reagiscono al toggle SU pointerdown,
-  // poi il successivo .click() lo richiude → "doppio toggle" che lascia il
-  // capitolo nello stato originale. Il diagnostico ha mostrato che la sola
-  // cosa che apre in modo affidabile è `topmost.click()` puro.
+  // Click "umano" sul topmost al centro del rect.
+  // Niente pointerdown/mousedown manuali: la piattaforma li tratta come
+  // toggle e il .click() successivo lo richiude (no-op apparente).
   function clickReale(elemento) {
     if (!elemento || !elemento.isConnected) return;
 
-    // Scrolla in vista PRIMA di calcolare le coordinate (elementFromPoint
-    // ritorna l'elemento alle coordinate del viewport, non del documento)
     try {
       const r0 = elemento.getBoundingClientRect();
       if (r0.top < 0 || r0.bottom > window.innerHeight) {
@@ -38,24 +32,15 @@
     const x = rect.left + rect.width / 2;
     const y = rect.top + rect.height / 2;
 
-    // Trova il VERO elemento topmost alle coordinate.
-    // Se per qualche motivo non lo troviamo o non è dentro il nostro elemento,
-    // facciamo fallback sull'elemento originale.
     let target = document.elementFromPoint(x, y);
     if (!target || (!elemento.contains(target) && target !== elemento)) {
       target = elemento;
     }
-
-    // Click vero sul topmost: l'unica cosa che ha funzionato nel diagnostico.
     try { target.click(); } catch { }
   }
 
-  // ── Stato "aperto" basato sul CONTENUTO REALE (ground truth) ──
-  // Un capitolo è aperto se nel suo container ci sono figli renderizzati
-  // (durate mm:ss o icona bullseye-arrow). NON usiamo il chevron come
-  // sorgente di verità: i suoi <path> SVG hanno ID auto-numerati (_1_, _2_,
-  // ...) che cambiano dopo i re-render Vue → falsi negativi che fanno
-  // saltare interi capitoli.
+  // Capitolo "aperto" = ha figli renderizzati (durate mm:ss / bullseye-arrow).
+  // Non usiamo il chevron: gli ID SVG cambiano dopo i rerender Vue.
   function capitoloAperto(headerCapitolo, prossimoHeader) {
     return haFigliNelRange(headerCapitolo, prossimoHeader);
   }
@@ -67,26 +52,36 @@
     return parseInt(el.textContent.replace('%', '').trim(), 10) || 0;
   }
 
-  // ── Raccoglie tutti i VERI capitoli (esclude header di sezione tipo "Lezioni") ──
-  // Restituisce array di { elemento, aperto }
+  // Allinea l'URL della SPA al capitolo N (Vue Router via pushState+popstate).
+  // Senza questo i capitoli "lontani" dall'URL attivo restano vuoti e i click
+  // sul loro header sono no-op.
+  async function navigaACapitolo(numeroCapitolo) {
+    const m = window.location.pathname.match(/\/videolezioni\/([^/]+)/);
+    if (!m) return false;
+    const corsoId = m[1];
+    const target = `/videolezioni/${corsoId}/${numeroCapitolo}`;
+    if (window.location.pathname === target) return true;
+    try {
+      history.pushState({}, '', target);
+      window.dispatchEvent(new PopStateEvent('popstate', { state: {} }));
+    } catch (e) {
+      console.log('[Pegaso] ⚠️ pushState fallito:', e.message);
+      return false;
+    }
+    await sleep(2500);
+    return true;
+  }
+
+  // Raccoglie i VERI capitoli (esclude header di sezione "Lezioni" ecc.).
+  // Tiene solo gli header che iniziano con "NUMERO - TITOLO".
   function raccogliCapitoli() {
     const intestazioni = document.querySelectorAll('.cursor-pointer.relative.align-middle');
     return Array.from(intestazioni)
-      .filter(el => {
-        // Tieni solo header che iniziano con "NUMERO - TITOLO" (es. "13 - Problemi di...")
-        // Esclude la voce di sezione "Lezioni" e simili.
-        const testo = (el.textContent || '').trim();
-        return /^\d+\s*[-–]\s*\S/.test(testo);
-      })
-      .map(el => {
-        const chevronDown = el.querySelector('path[id="chevron-down-Filled_1_"]');
-        return { elemento: el, aperto: !chevronDown };
-      });
+      .filter(el => /^\d+\s*[-–]\s*\S/.test((el.textContent || '').trim()))
+      .map(el => ({ elemento: el }));
   }
 
-  // ── Attende che il header sia DAVVERO renderizzato (ha almeno un SVG path) ──
-  // A causa del virtual scroll, un header fuori viewport può avere solo il container
-  // ma non il suo contenuto interno (chevron, ecc.) nel DOM.
+  // Attende che il header abbia un SVG path renderizzato (virtual scroll).
   async function attendiHeaderRenderizzato(headerCapitolo, maxMs = 3000) {
     let attesa = 0;
     while (attesa < maxMs) {
@@ -97,47 +92,32 @@
     return false;
   }
 
-  // ── Apre un singolo capitolo con polling affidabile (NON chiude mai) ──
-  // Strategia robusta contro il virtual scroll + Vue:
-  //  1) Scroll into view + attesa header renderizzato
-  //  2) Loop fino a MAX_TENTATIVI: se chiuso → click reale → verifica
-  //     che il chevron sia DAVVERO cambiato. Se no, riscrolla e riprova.
-  //  3) Quando il chevron è "up" (aperto), poll sui figli per max 5s.
-  // Restituisce true se al termine ci sono figli renderizzati.
+  // Apre il dropdown del capitolo. Lo stato "aperto" è deciso dal contenuto
+  // (non dal chevron). Il PRIMO tentativo aspetta più a lungo: dopo una
+  // navigaACapitolo il render della sidebar è lento e con timeout corti
+  // fallisce sempre.
   async function apriCapitolo(capitolo, prossimoHeader) {
     const MAX_TENTATIVI = 5;
 
-    // 1. Scrolla l'header nella viewport
     try {
       capitolo.elemento.scrollIntoView({ block: 'center', behavior: 'instant' });
     } catch {
       capitolo.elemento.scrollIntoView();
     }
     await sleep(400);
-
-    // 2. Attesa che il header sia renderizzato (virtual scroll)
     await attendiHeaderRenderizzato(capitolo.elemento);
 
-    // 2b. Attesa "grace period" per dare tempo ai figli di apparire se il
-    //     capitolo era GIÀ aperto (es. quelli completati prima dello script).
-    //     Senza questa attesa entriamo subito nel retry-loop e clicchiamo
-    //     inutilmente (rischiando anche di CHIUDERLO al primo click).
+    // Grace period: se il capitolo è GIÀ aperto evita di cliccarlo
+    // (un click su uno aperto lo chiude).
     let attesaIniziale = 0;
-    while (attesaIniziale < 1200 && !capitoloAperto(capitolo.elemento, prossimoHeader)) {
+    while (attesaIniziale < 2000 && !capitoloAperto(capitolo.elemento, prossimoHeader)) {
       await sleep(200);
       attesaIniziale += 200;
     }
 
-    // 3. Loop di apertura basato sul CONTENUTO REALE (non sul chevron).
-    //    Il chevron-down ha ID auto-numerati (_1_, _2_, ...) che cambiano
-    //    dopo i re-render Vue, quindi non è una fonte di verità affidabile.
-    //    Affidiamoci alla presenza dei figli del capitolo.
     for (let tentativo = 1; tentativo <= MAX_TENTATIVI; tentativo++) {
-      // Già aperto (figli presenti nel suo container)? Bene.
       if (capitoloAperto(capitolo.elemento, prossimoHeader)) break;
 
-      // Riassicura la posizione PRIMA di ogni click (la chiusura del precedente
-      // o il render del virtual scroll possono aver mosso l'elemento).
       try {
         capitolo.elemento.scrollIntoView({ block: 'center', behavior: 'instant' });
       } catch { }
@@ -146,28 +126,27 @@
 
       clickReale(capitolo.elemento);
 
-      // Aspetto che i figli appaiano (max ~1.5s a tentativo)
+      // Primo tentativo: attesa più generosa (4s) perché il render dopo
+      // navigaACapitolo è lento. Tentativi successivi: 1.8s.
+      const limite = tentativo === 1 ? 4000 : 1800;
       let atteso = 0;
       const passo = 150;
-      const limite = 1500;
       while (atteso < limite && !capitoloAperto(capitolo.elemento, prossimoHeader)) {
         await sleep(passo);
         atteso += passo;
       }
 
-      if (capitoloAperto(capitolo.elemento, prossimoHeader)) break; // aperto!
+      if (capitoloAperto(capitolo.elemento, prossimoHeader)) break;
 
       if (tentativo < MAX_TENTATIVI) {
-        console.log(`[Pegaso] 🔁 Capitolo non aperto, retry click ${tentativo + 1}/${MAX_TENTATIVI}...`);
-        await sleep(300 + tentativo * 200); // backoff progressivo
+        await sleep(300 + tentativo * 200); // backoff progressivo, no log
       }
     }
 
-    // 4. Polling finale: aspetta finché i figli sono renderizzati (max 5s)
     return await attendiFigli(capitolo.elemento, prossimoHeader, 5000);
   }
 
-  // ── Polling: aspetta che ci siano figli renderizzati nel container del capitolo ──
+  // Polling: aspetta che il container del capitolo abbia figli (max maxMs).
   async function attendiFigli(headerCapitolo, prossimoHeader, maxMs = 4000) {
     let attesa = 0;
     while (attesa < maxMs) {
@@ -178,8 +157,8 @@
     return false;
   }
 
-  // ── Verifica se nel container del capitolo c'è ALMENO un figlio interessante ──
-  // Cerca segnali tipici: SVG bullseye-arrow, durate mm:ss.
+  // True se il container del capitolo contiene almeno una durata mm:ss
+  // o l'icona bullseye-arrow ("Obiettivi").
   function haFigliNelRange(headerCapitolo, prossimoHeader) {
     const container = trovaContainerCapitolo(headerCapitolo, prossimoHeader);
     if (!container) return false;
@@ -188,23 +167,18 @@
       const txt = (d.textContent || '').trim();
       if (/^\d{1,3}:\d{2}$/.test(txt)) return true;
     }
-    // Anche l'icona bullseye-arrow può avere ID auto-numerati: usa starts-with
     if (container.querySelector('svg path[id^="bullseye-arrow"]')) return true;
     return false;
   }
 
-  // ── Chiude un singolo capitolo (con verifica del cambio di stato) ──
-  // Usa la presenza dei figli come ground truth (non il chevron).
+  // Chiude il dropdown del capitolo (no-op se già chiuso).
   async function chiudiCapitolo(capitolo, prossimoHeader) {
     try { capitolo.elemento.scrollIntoView({ block: 'center' }); } catch { }
     await sleep(200);
-    // Attendi che il header sia renderizzato prima di leggere lo stato
     await attendiHeaderRenderizzato(capitolo.elemento, 1500);
 
-    // Se è già chiuso (nessun figlio renderizzato), non fare nulla
     if (!capitoloAperto(capitolo.elemento, prossimoHeader)) return;
 
-    // Loop di chiusura con verifica
     for (let tentativo = 1; tentativo <= 3; tentativo++) {
       if (!capitoloAperto(capitolo.elemento, prossimoHeader)) return;
       clickReale(capitolo.elemento);
@@ -218,30 +192,21 @@
     }
   }
 
-  // ── Helper: trova il CONTAINER del capitolo corrente ──
-  // Risale dal header finché il wrapper contiene il header MA NON il prossimo header.
-  // Questo è il modo più robusto per isolare i contenuti di UN solo capitolo:
-  // niente DOM-range fragili, solo "il più piccolo ancestor che contiene solo questo capitolo".
+  // Trova il più piccolo ancestor del header che contiene questo capitolo
+  // ma NON il prossimo header (così isoliamo i suoi figli).
   function trovaContainerCapitolo(headerCapitolo, prossimoHeader) {
     if (!headerCapitolo || !headerCapitolo.isConnected) return null;
 
     let candidato = headerCapitolo.parentElement;
     while (candidato) {
-      // Se il candidato contiene anche il prossimo header, siamo saliti troppo → torna giù
       if (prossimoHeader && prossimoHeader.isConnected && candidato.contains(prossimoHeader)) {
-        // Il livello precedente è quello giusto, ma se abbiamo già fatto un solo passo,
-        // torniamo lo stesso parentElement (caso del primo capitolo che parte da una root)
         break;
       }
-      // Il candidato è buono se contiene il header E almeno UN figlio "interessante"
-      // (durata mm:ss o bullseye-arrow) oltre al solo header.
       const haContenuti =
         candidato.querySelector('svg path[id^="bullseye-arrow"]') ||
         Array.from(candidato.querySelectorAll('.text-sm.text-platform-gray'))
           .some(d => /^\d{1,3}:\d{2}$/.test((d.textContent || '').trim()));
       if (haContenuti) {
-        // Promuovo: salgo ancora di un livello per essere sicuro di abbracciare
-        // tutti i figli del capitolo (a volte il wrapper diretto non basta)
         const piuSu = candidato.parentElement;
         if (piuSu && (!prossimoHeader || !piuSu.contains(prossimoHeader))) {
           candidato = piuSu;
@@ -252,42 +217,18 @@
       candidato = candidato.parentElement;
     }
 
-    // Fallback: ritorna il parent diretto del header
     return headerCapitolo.parentElement || headerCapitolo;
   }
 
-  // ── Helper legacy: true se `el` è nel DOM TRA `inizio` (esclusivo) e `fine` (esclusivo) ──
-  // Mantenuto come fallback per haFigliNelRange.
-  function elementoNelRange(el, inizio, fine) {
-    if (!el || !inizio || !el.isConnected || !inizio.isConnected) return false;
-    const dopoInizio = inizio.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING;
-    if (!dopoInizio) return false;
-    if (fine && fine.isConnected) {
-      const primaDelFine = el.compareDocumentPosition(fine) & Node.DOCUMENT_POSITION_FOLLOWING;
-      if (!primaDelFine) return false;
-    }
-    return true;
-  }
-
-  // ── Trova e clicca l'item "Obiettivi" del SOLO capitolo corrente ──
-  // Cerca i bullseye-arrow nel CONTAINER del capitolo (approccio robusto).
-  // Restituisce il numero di item cliccati (di solito 0 o 1).
+  // Clicca sull'item "Obiettivi" del capitolo. Ritorna il numero di item cliccati.
   async function cliccaObiettivi(headerCapitolo, prossimoHeader) {
     const container = trovaContainerCapitolo(headerCapitolo, prossimoHeader);
-    if (!container) {
-      console.log('[Pegaso] ℹ️  Container capitolo non trovato.');
-      return 0;
-    }
-    const svgs = container.querySelectorAll('svg path[id="bullseye-arrow"]');
-
-    if (svgs.length === 0) {
-      console.log('[Pegaso] ℹ️  Item "Obiettivi" non trovato in questo capitolo.');
-      return 0;
-    }
+    if (!container) return 0;
+    const svgs = container.querySelectorAll('svg path[id^="bullseye-arrow"]');
+    if (svgs.length === 0) return 0;
 
     let cliccati = 0;
     for (const svg of svgs) {
-      // Cerca il container cliccabile salendo l'albero, con vari fallback
       const cliccabile =
         svg.closest('.cursor-pointer') ||
         svg.closest('[role="button"]') ||
@@ -298,19 +239,12 @@
         svg.closest('li') ||
         svg.parentElement?.parentElement ||
         svg.parentElement;
+      if (!cliccabile) continue;
 
-      if (!cliccabile) {
-        console.log('[Pegaso] ⚠️  Trovato "Obiettivi" ma nessun contenitore cliccabile.');
-        continue;
-      }
-
-      console.log('[Pegaso] 🎯 Clicco su "Obiettivi"...');
       clickReale(cliccabile);
       cliccati++;
-      // Pausa per dare tempo alla piattaforma di registrare la visualizzazione
-      await sleep(2500);
+      await sleep(2500); // tempo per registrare la visualizzazione
     }
-
     return cliccati;
   }
 
@@ -411,61 +345,50 @@
     await sleep(1000);
   }
 
-  // ── Processa tutti i video di UN capitolo ─────────────────
-  // Restituisce true se l'obiettivo è già stato raggiunto.
-  // headerCapitolo / prossimoHeader = elementi DOM dei due capitoli consecutivi,
-  // usati per scopare le ricerche al solo capitolo corrente.
+  // Processa un capitolo: clicca "Obiettivi" e (se non SOLO_OBIETTIVI) avvia
+  // i video da completare. Ritorna true se l'obiettivo % è stato raggiunto.
   async function processaCapitolo(indiceCapitolo, headerCapitolo, prossimoHeader) {
-    // Log diagnostico: mostra il titolo letto dal header per verificare l'allineamento
-    const titoloCap = (headerCapitolo?.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 80);
-    console.log(`[Pegaso] 🧭 Capitolo ${indiceCapitolo + 1} header: "${titoloCap}"`);
+    const numCap = indiceCapitolo + 1;
 
-    // 1. Clicca su "Obiettivi" del SOLO capitolo corrente
-    //    (anche se i video sono già completati al 100%)
+    // Sempre: clicca "Obiettivi" (registra la visualizzazione).
     await cliccaObiettivi(headerCapitolo, prossimoHeader);
+
+    if (SOLO_OBIETTIVI) {
+      console.log(`[Pegaso] 🎯 Capitolo ${numCap}: solo Obiettivi (video saltati).`);
+      return false;
+    }
 
     const lezioniTutte = raccogliLezioniVideo(headerCapitolo, prossimoHeader);
     const lezioniDaFare = lezioniTutte
       .filter(l => l.percentuale < 100)
       .sort((a, b) => b.durata_secondi - a.durata_secondi);
 
-    console.log(`[Pegaso] 🔎 Righe video rilevate: ${lezioniTutte.length} (di cui ${lezioniDaFare.length} da completare)`);
-
     if (lezioniTutte.length === 0) {
-      console.log(`[Pegaso] ⚠️  Capitolo ${indiceCapitolo + 1}: 0 righe video rilevate. Possibile cambio dei selettori della piattaforma.`);
+      console.log(`[Pegaso] ⚠️  Capitolo ${numCap}: 0 righe video rilevate (selettori cambiati?).`);
       return false;
     }
-
     if (lezioniDaFare.length === 0) {
-      console.log(`[Pegaso] ✔️  Capitolo ${indiceCapitolo + 1}: nessun video da completare, passo oltre.`);
+      console.log(`[Pegaso] ✔️  Capitolo ${numCap}: già completato.`);
       return false;
     }
 
-    console.log(`[Pegaso] 📖 Capitolo ${indiceCapitolo + 1}: ${lezioniDaFare.length} video da completare`);
+    console.log(`[Pegaso] 📖 Capitolo ${numCap}: ${lezioniDaFare.length} video da completare`);
 
     for (const lezione of lezioniDaFare) {
       const pctAttuale = leggiPercentualeTotale();
-      console.log(`\n[Pegaso] 📊 Percentuale corso: ${pctAttuale}%`);
-
       if (pctAttuale >= OBIETTIVO_PERCENTUALE) {
-        console.log(`[Pegaso] 🏁 Obiettivo ${OBIETTIVO_PERCENTUALE}% raggiunto! Script terminato.`);
+        console.log(`[Pegaso] 🏁 Obiettivo ${OBIETTIVO_PERCENTUALE}% raggiunto (${pctAttuale}%). Script terminato.`);
         console.log('[Pegaso] ℹ️  Premi F5 per aggiornare la pagina.');
-        return true; // segnala "obiettivo raggiunto"
+        return true;
       }
 
       const min = Math.floor(lezione.durata_secondi / 60);
       const sec = lezione.durata_secondi % 60;
-      console.log(`[Pegaso] ▶️  Avvio: "${lezione.titolo}" (durata: ${min}:${String(sec).padStart(2, '0')})`);
+      console.log(`[Pegaso] ▶️  "${lezione.titolo}" (${min}:${String(sec).padStart(2, '0')})`);
 
       clickReale(lezione.elemento);
-
-      console.log('[Pegaso] ⏳ Attendo che il video si carichi...');
       await aspettaCambioVideo(15);
-
-      console.log(`[Pegaso] ⏳ Video in riproduzione, aspetto la fine (~${min} minuti)...`);
       await aspettaFineVideo(lezione.durata_secondi);
-
-      console.log(`[Pegaso] ⏸️  Pausa di ${PAUSA_TRA_LEZIONI_MS / 1000}s...`);
       await sleep(PAUSA_TRA_LEZIONI_MS);
     }
 
@@ -478,9 +401,11 @@
 
   console.log('═══════════════════════════════════════════════');
   if (TEST_MODE) {
-    console.log('[Pegaso] 🧪 MODALITÀ TEST - verrà eseguito SOLO 1 video (il più corto)');
+    console.log('[Pegaso] 🧪 MODALITÀ TEST - SOLO 1 video (il più corto)');
+  } else if (SOLO_OBIETTIVI) {
+    console.log(`[Pegaso] 🎯 MODALITÀ SOLO OBIETTIVI - dal cap. ${CAPITOLO_INIZIO}, video saltati`);
   } else {
-    console.log('[Pegaso] 🚀 MODALITÀ COMPLETA - va avanti capitolo per capitolo fino al 70%');
+    console.log(`[Pegaso] 🚀 MODALITÀ COMPLETA - dal cap. ${CAPITOLO_INIZIO} fino al ${OBIETTIVO_PERCENTUALE}%`);
   }
   console.log('═══════════════════════════════════════════════');
 
@@ -539,70 +464,60 @@
     return;
   }
 
-  // ══════════════════════════════════════════════════════════
-  //  MODALITÀ COMPLETA — loop sui capitoli
-  // ══════════════════════════════════════════════════════════
-  // NB: il numero totale di capitoli viene fissato all'inizio,
-  // ma le REFERENCE agli elementi DOM vengono ri-prese ad ogni iterazione
-  // perché la SPA Vue rerendera la sidebar dopo ogni navigazione (es. clic su Obiettivi).
+  // ═══ MODALITÀ COMPLETA — loop sui capitoli ═══
+  // I riferimenti DOM vengono ri-presi ad ogni iterazione: la SPA rerendera
+  // la sidebar dopo ogni navigazione/click.
   const totaleCapitoli = capitoli.length;
+  const indiceInizio = Math.max(0, (CAPITOLO_INIZIO || 1) - 1);
 
-  for (let i = 0; i < totaleCapitoli; i++) {
-    // Salta i capitoli fuori dal range SOLO_CAPITOLI (se impostato)
+  for (let i = indiceInizio; i < totaleCapitoli; i++) {
     const numeroCapitolo = i + 1;
-    if (SOLO_CAPITOLI && !SOLO_CAPITOLI.includes(numeroCapitolo)) {
-      continue;
-    }
+    if (SOLO_CAPITOLI && !SOLO_CAPITOLI.includes(numeroCapitolo)) continue;
 
     const pctCorso = leggiPercentualeTotale();
     console.log(`\n[Pegaso] ════════════════════════════════════`);
-    console.log(`[Pegaso] 📂 Capitolo ${i + 1} di ${totaleCapitoli} — Corso al ${pctCorso}%`);
+    console.log(`[Pegaso] 📂 Capitolo ${numeroCapitolo} di ${totaleCapitoli} — Corso al ${pctCorso}%`);
 
-    if (pctCorso >= OBIETTIVO_PERCENTUALE) {
+    if (!SOLO_OBIETTIVI && pctCorso >= OBIETTIVO_PERCENTUALE) {
       console.log(`[Pegaso] 🏁 Obiettivo ${OBIETTIVO_PERCENTUALE}% raggiunto! Script terminato.`);
       console.log('[Pegaso] ℹ️  Premi F5 per aggiornare la pagina.');
       return;
     }
 
-    // Ri-raccoglie i capitoli FRESCHI dal DOM (i riferimenti vecchi sono stale
-    // dopo ogni navigazione SPA causata dal click su Obiettivi/video)
+    // Allinea l'URL della SPA al capitolo (Vue Router popola la sidebar).
+    await navigaACapitolo(numeroCapitolo);
+
+    // Re-fetch dei riferimenti DOM (sono stale dopo ogni rerender SPA).
     const capitoliCorrenti = raccogliCapitoli();
     if (i >= capitoliCorrenti.length) {
-      console.log(`[Pegaso] ⚠️  Indice capitolo fuori range dopo re-fetch (${i} ≥ ${capitoliCorrenti.length}). Mi fermo.`);
+      console.log(`[Pegaso] ⚠️  Indice capitolo fuori range (${i} ≥ ${capitoliCorrenti.length}). Mi fermo.`);
       return;
     }
 
     const capCorrente = capitoliCorrenti[i];
-    const capProssimo = capitoliCorrenti[i + 1]; // può essere undefined sull'ultimo
+    const capProssimo = capitoliCorrenti[i + 1];
     const headerCorrente = capCorrente.elemento;
     const headerProssimo = capProssimo ? capProssimo.elemento : null;
 
-    // Chiude il capitolo PRECEDENTE per non gonfiare la sidebar
-    // (con 40+ capitoli aperti il virtual scroll diventa instabile)
-    if (i > 0 && capitoliCorrenti[i - 1]) {
-      // Per scopare correttamente il container del precedente passiamo
-      // come "prossimoHeader" l'header del capitolo corrente.
+    // Chiude il precedente per non gonfiare il virtual scroll.
+    if (i > indiceInizio && capitoliCorrenti[i - 1]) {
       await chiudiCapitolo(capitoliCorrenti[i - 1], headerCorrente);
     }
 
-    // Apre il capitolo corrente con scroll-into-view + apertura forzata
-    // (la sidebar usa virtual scroll: senza questo i figli non sono nel DOM)
     const figliOk = await apriCapitolo(capCorrente, headerProssimo);
     if (!figliOk) {
-      console.log(`[Pegaso] ⚠️  Capitolo ${i + 1}: figli non renderizzati dopo l'apertura. Riprovo a scrollare e re-apro fra 1s...`);
+      console.log(`[Pegaso] ⚠️  Capitolo ${numeroCapitolo}: figli non renderizzati, retry...`);
       await sleep(1000);
       headerCorrente.scrollIntoView({ block: 'center' });
       await sleep(800);
       await apriCapitolo(capCorrente, headerProssimo);
     }
-    await sleep(500); // attesa extra per sicurezza DOM
+    await sleep(500);
 
-    // Processa i video di questo capitolo
     const obiettivoRaggiunto = await processaCapitolo(i, headerCorrente, headerProssimo);
     if (obiettivoRaggiunto) return;
 
-    console.log(`[Pegaso] ✅ Capitolo ${i + 1} completato, passo al successivo...`);
-    await sleep(1000);
+    await sleep(800);
   }
 
   console.log('\n[Pegaso] ✅ Tutti i capitoli processati. Premi F5 per vedere la percentuale finale.');
